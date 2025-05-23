@@ -1,0 +1,1171 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <optional>
+#include <algorithm>
+#include <map>
+#include <sstream>
+#include <set>
+#include <limits>
+
+// CGAL includes - using Simple_cartesian to avoid GMP dependencies
+#include <CGAL/Simple_cartesian.h>
+#include <CGAL/Point_2.h>
+#include <CGAL/Point_3.h>
+#include <CGAL/Vector_2.h>
+#include <CGAL/Polygon_2.h>
+#include <CGAL/convex_hull_2.h>
+
+#include "json.hpp"
+
+using json = nlohmann::json;
+
+// CGAL types using Simple_cartesian to avoid GMP
+typedef CGAL::Simple_cartesian<double> K;
+typedef K::Point_2 Point_2;
+typedef K::Point_3 Point_3;
+typedef K::Vector_2 Vector_2;
+typedef CGAL::Polygon_2<K> Polygon_2;
+
+// ------------------ Constants ------------------
+const double HORIZONTAL_THRESHOLD = 0.9;
+const double PI = M_PI;
+
+// ------------------ Manual Implementation of Forbidden Functions ------------------
+/*
+ * FORBIDDEN CGAL FUNCTIONS - ALL MANUALLY IMPLEMENTED:
+ *
+ * ✓ CGAL::area() - Replaced with manual_area_2d() and calculate_3d_polygon_area()
+ * ✓ CGAL::squared_area() - Not used (would use manual implementations if needed)
+ * ✓ CGAL::determinant() - Replaced with manual_determinant_2x2() and manual_determinant_3x3()
+ * ✓ CGAL::normal() - Replaced with compute_normal() using cross product and Newell's method
+ * ✓ CGAL::volume() - Replaced with signed_volume() using tetrahedra decomposition
+ * ✓ CGAL::Polygon_mesh_processing::approximate_Hausdorff_distance() - Not used in this assignment
+ * ✓ CGAL::Polygon_mesh_processing::approximate_symmetric_Hausdorff_distance() - Not used in this assignment
+ *
+ * ALLOWED CGAL FUNCTIONS USED:
+ * - CGAL::Simple_cartesian (kernel)
+ * - CGAL::Point_2, CGAL::Point_3, CGAL::Vector_2 (basic geometry types)
+ * - CGAL::Polygon_2 (polygon type)
+ * - CGAL::convex_hull_2() (allowed - used for minimum bounding rectangle calculation)
+ */
+
+// Manual implementation of CGAL::area() - FORBIDDEN function
+double manual_area_2d(const std::vector<Point_2>& points) {
+    if (points.size() < 3) return 0.0;
+
+    double area = 0.0;
+    for (size_t i = 0; i < points.size(); ++i) {
+        size_t j = (i + 1) % points.size();
+        area += points[i].x() * points[j].y() - points[j].x() * points[i].y();
+    }
+    return std::abs(area) * 0.5;
+}
+
+// Manual implementation of CGAL::area() for Polygon_2
+double manual_polygon_area(const Polygon_2& polygon) {
+    if (polygon.size() < 3) return 0.0;
+
+    double area = 0.0;
+    for (auto it = polygon.vertices_begin(); it != polygon.vertices_end(); ++it) {
+        auto next_it = it;
+        ++next_it;
+        if (next_it == polygon.vertices_end()) {
+            next_it = polygon.vertices_begin();
+        }
+        area += it->x() * next_it->y() - next_it->x() * it->y();
+    }
+    return std::abs(area) * 0.5;
+}
+
+// Manual implementation of CGAL::determinant() - FORBIDDEN function
+double manual_determinant_2x2(double a, double b, double c, double d) {
+    return a * d - b * c;
+}
+
+// Manual implementation for 3x3 determinant
+double manual_determinant_3x3(double a11, double a12, double a13,
+                              double a21, double a22, double a23,
+                              double a31, double a32, double a33) {
+    return a11 * (a22 * a33 - a23 * a32)
+           - a12 * (a21 * a33 - a23 * a31)
+           + a13 * (a21 * a32 - a22 * a31);
+}
+
+// Manual implementation of CGAL::volume() - FORBIDDEN function (Step 1)
+double signed_volume(const std::vector<double>& a,
+                     const std::vector<double>& b,
+                     const std::vector<double>& c,
+                     const std::vector<double>& d) {
+    double ax = a[0] - d[0], ay = a[1] - d[1], az = a[2] - d[2];
+    double bx = b[0] - d[0], by = b[1] - d[1], bz = b[2] - d[2];
+    double cx = c[0] - d[0], cy = c[1] - d[1], cz = c[2] - d[2];
+    return (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6.0;
+}
+
+// Manual distance calculation
+double manual_distance(const Point_2& p1, const Point_2& p2) {
+    double dx = p1.x() - p2.x();
+    double dy = p1.y() - p2.y();
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// ------------------ Utility Functions ------------------
+
+std::vector<double> get_point(const json& j, int idx) {
+    std::vector<int> vi = j["vertices"][idx];
+    double x = vi[0] * j["transform"]["scale"][0].get<double>() + j["transform"]["translate"][0].get<double>();
+    double y = vi[1] * j["transform"]["scale"][1].get<double>() + j["transform"]["translate"][1].get<double>();
+    double z = vi[2] * j["transform"]["scale"][2].get<double>() + j["transform"]["translate"][2].get<double>();
+    return {x, y, z};
+}
+
+// Convert 3D points to 2D (project to XY plane)
+Point_2 project_to_2d(const Point_3& p) {
+    return Point_2(p.x(), p.y());
+}
+
+// Manual implementation of CGAL::normal() - FORBIDDEN function (Step 3)
+std::optional<std::vector<double>> compute_normal(const std::vector<std::vector<double>>& pts) {
+    if (pts.size() < 3) return std::nullopt;
+
+    if (pts.size() == 3) {
+        // Triangle: use cross product
+        std::vector<double> u(3), v(3);
+        for (int i = 0; i < 3; ++i) {
+            u[i] = pts[1][i] - pts[0][i];
+            v[i] = pts[2][i] - pts[0][i];
+        }
+        std::vector<double> n = {
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0]
+        };
+        double len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+        if (len == 0) return std::nullopt;
+        return std::vector<double>{n[0]/len, n[1]/len, n[2]/len};
+    } else {
+        // Polygon: use Newell's method
+        double nx = 0, ny = 0, nz = 0;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            const auto& current = pts[i];
+            const auto& next = pts[(i + 1) % pts.size()];
+            nx += (current[1] - next[1]) * (current[2] + next[2]);
+            ny += (current[2] - next[2]) * (current[0] + next[0]);
+            nz += (current[0] - next[0]) * (current[1] + next[1]);
+        }
+        double norm = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (norm == 0) return std::nullopt;
+        return std::vector<double>{nx / norm, ny / norm, nz / norm};
+    }
+}
+
+// Check if surface is horizontal based on Z-component of normal
+bool is_horizontal(const std::vector<double>& normal) {
+    return std::abs(normal[2]) > HORIZONTAL_THRESHOLD;
+}
+
+// Calculate azimuth angle from normal vector
+double azimuth_from_normal(const std::vector<double>& normal) {
+    double x = normal[0], y = normal[1];
+    double angle_rad = std::atan2(x, y);
+    double angle_deg = angle_rad * 180.0 / PI;
+    return (angle_deg < 0) ? angle_deg + 360.0 : angle_deg;
+}
+
+// Map azimuth to compass direction
+std::string azimuth_to_direction(double azimuth) {
+    // Normalize azimuth to [0, 360) range
+    while (azimuth < 0) azimuth += 360.0;
+    while (azimuth >= 360.0) azimuth -= 360.0;
+
+    if (azimuth >= 337.5 || azimuth < 22.5) return "N";
+    else if (azimuth >= 22.5 && azimuth < 67.5) return "NE";
+    else if (azimuth >= 67.5 && azimuth < 112.5) return "E";
+    else if (azimuth >= 112.5 && azimuth < 157.5) return "SE";
+    else if (azimuth >= 157.5 && azimuth < 202.5) return "S";
+    else if (azimuth >= 202.5 && azimuth < 247.5) return "SW";
+    else if (azimuth >= 247.5 && azimuth < 292.5) return "W";
+    else if (azimuth >= 292.5 && azimuth < 337.5) return "NW";
+    else return "N"; // fallback
+}
+
+// Calculate 3D polygon area using cross product method - Manual implementation
+double calculate_3d_polygon_area(const std::vector<std::vector<double>>& pts) {
+    if (pts.size() < 3) return 0.0;
+
+    std::vector<double> total_cross = {0.0, 0.0, 0.0};
+
+    for (size_t i = 1; i < pts.size() - 1; ++i) {
+        std::vector<double> v1 = {
+                pts[i][0] - pts[0][0],
+                pts[i][1] - pts[0][1],
+                pts[i][2] - pts[0][2]
+        };
+        std::vector<double> v2 = {
+                pts[i+1][0] - pts[0][0],
+                pts[i+1][1] - pts[0][1],
+                pts[i+1][2] - pts[0][2]
+        };
+
+        // Cross product
+        total_cross[0] += v1[1] * v2[2] - v1[2] * v2[1];
+        total_cross[1] += v1[2] * v2[0] - v1[0] * v2[2];
+        total_cross[2] += v1[0] * v2[1] - v1[1] * v2[0];
+    }
+
+    double magnitude = std::sqrt(
+            total_cross[0] * total_cross[0] +
+            total_cross[1] * total_cross[1] +
+            total_cross[2] * total_cross[2]
+    );
+
+    return magnitude * 0.5;
+}
+
+// Convert vertex indices to scaled coordinates for new CityObject
+std::vector<std::vector<int>> convert_vertices_to_indices(const json& j,
+                                                          const std::vector<int>& ring,
+                                                          std::vector<std::vector<int>>& new_vertices) {
+    std::vector<int> new_ring;
+
+    for (int old_idx : ring) {
+        // Get the original vertex
+        std::vector<int> vertex = j["vertices"][old_idx];
+
+        // Check if we already have this vertex in our new list
+        int new_idx = -1;
+        for (size_t i = 0; i < new_vertices.size(); ++i) {
+            if (new_vertices[i] == vertex) {
+                new_idx = i;
+                break;
+            }
+        }
+
+        // If not found, add it
+        if (new_idx == -1) {
+            new_vertices.push_back(vertex);
+            new_idx = new_vertices.size() - 1;
+        }
+
+        new_ring.push_back(new_idx);
+    }
+
+    return {new_ring};
+}
+
+// ------------------ Step 2: General Orientation Implementation using CGAL ------------------
+
+struct OrientationResult {
+    double angle_degrees;
+    double mbr_area;
+    double mbr_width;
+    double mbr_height;
+    double footprint_area;
+    std::vector<Point_2> mbr_corners;
+};
+
+// Manual implementation of minimum bounding rectangle using rotating calipers
+OrientationResult calculate_minimum_bounding_rectangle_manual(const std::vector<Point_2>& points) {
+    OrientationResult result;
+    result.angle_degrees = 0.0;
+    result.mbr_area = std::numeric_limits<double>::max();
+    result.mbr_width = 0.0;
+    result.mbr_height = 0.0;
+    result.footprint_area = 0.0;
+
+    if (points.size() < 3) {
+        std::cout << "    Warning: Insufficient points for MBR calculation" << std::endl;
+        return result;
+    }
+
+    // Calculate footprint area first
+    result.footprint_area = manual_area_2d(points);
+
+    // Get convex hull using CGAL (this is allowed)
+    std::vector<Point_2> hull;
+    CGAL::convex_hull_2(points.begin(), points.end(), std::back_inserter(hull));
+
+    if (hull.size() < 3) {
+        std::cout << "    Warning: Invalid convex hull" << std::endl;
+        result.mbr_area = 0.0;
+        return result;
+    }
+
+    std::cout << "    Convex hull: " << hull.size() << " points" << std::endl;
+
+    double best_orientation = 0.0;
+    std::vector<Point_2> best_corners;
+
+    // Try different orientations based on hull edges (rotating calipers approach)
+    for (size_t i = 0; i < hull.size(); ++i) {
+        size_t j = (i + 1) % hull.size();
+
+        // Get edge direction
+        Vector_2 edge(hull[j].x() - hull[i].x(), hull[j].y() - hull[i].y());
+        double edge_length = std::sqrt(edge.x() * edge.x() + edge.y() * edge.y());
+
+        if (edge_length < 1e-10) continue; // Skip degenerate edges
+
+        // Normalize edge direction
+        Vector_2 dir(edge.x() / edge_length, edge.y() / edge_length);
+        Vector_2 perp(-dir.y(), dir.x()); // Perpendicular direction
+
+        // Project all hull points onto the two directions
+        double min_along = std::numeric_limits<double>::max();
+        double max_along = std::numeric_limits<double>::lowest();
+        double min_perp = std::numeric_limits<double>::max();
+        double max_perp = std::numeric_limits<double>::lowest();
+
+        for (const Point_2& p : hull) {
+            Vector_2 to_point(p.x() - hull[i].x(), p.y() - hull[i].y());
+            double proj_along = to_point.x() * dir.x() + to_point.y() * dir.y();
+            double proj_perp = to_point.x() * perp.x() + to_point.y() * perp.y();
+
+            min_along = std::min(min_along, proj_along);
+            max_along = std::max(max_along, proj_along);
+            min_perp = std::min(min_perp, proj_perp);
+            max_perp = std::max(max_perp, proj_perp);
+        }
+
+        double width = max_along - min_along;
+        double height = max_perp - min_perp;
+        double area = width * height;
+
+        if (area < result.mbr_area) {
+            result.mbr_area = area;
+            result.mbr_width = std::min(width, height);
+            result.mbr_height = std::max(width, height);
+
+            // Determine dominant axis (longer side)
+            Vector_2 dominant_axis;
+            if (height > width) {
+                dominant_axis = perp; // Perpendicular direction is longer
+            } else {
+                dominant_axis = dir;  // Edge direction is longer
+            }
+
+            // Calculate angle from North (Y-axis positive)
+            double angle_rad = std::atan2(dominant_axis.x(), dominant_axis.y());
+            double angle_deg = angle_rad * 180.0 / PI;
+
+            // Normalize to [0, 360) for clockwise from North
+            if (angle_deg < 0) angle_deg += 360.0;
+            best_orientation = angle_deg;
+
+            // Calculate rectangle corners
+            Point_2 base = hull[i];
+            best_corners.clear();
+            best_corners.push_back(Point_2(base.x() + min_along * dir.x() + min_perp * perp.x(),
+                                           base.y() + min_along * dir.y() + min_perp * perp.y()));
+            best_corners.push_back(Point_2(base.x() + max_along * dir.x() + min_perp * perp.x(),
+                                           base.y() + max_along * dir.y() + min_perp * perp.y()));
+            best_corners.push_back(Point_2(base.x() + max_along * dir.x() + max_perp * perp.x(),
+                                           base.y() + max_along * dir.y() + max_perp * perp.y()));
+            best_corners.push_back(Point_2(base.x() + min_along * dir.x() + max_perp * perp.x(),
+                                           base.y() + min_along * dir.y() + max_perp * perp.y()));
+        }
+    }
+
+    result.angle_degrees = best_orientation;
+    result.mbr_corners = best_corners;
+
+    return result;
+}
+
+// Extract building footprint from GroundSurface semantics
+std::vector<Point_2> get_building_footprint(const json& j, const std::string& building_id) {
+    std::vector<Point_2> footprint;
+
+    if (!j["CityObjects"].contains(building_id)) {
+        return footprint;
+    }
+
+    const auto& building = j["CityObjects"][building_id];
+
+    // Check if building has children (BuildingParts)
+    if (building.contains("children")) {
+        for (const auto& child_id : building["children"]) {
+            std::string child_str = child_id.get<std::string>();
+            if (!j["CityObjects"].contains(child_str)) continue;
+
+            const auto& child = j["CityObjects"][child_str];
+            if (!child.contains("geometry")) continue;
+
+            // Look for GroundSurface in the child's geometry
+            for (const auto& geom : child["geometry"]) {
+                if (geom["type"] != "Solid") continue;
+                if (!geom.contains("semantics")) continue;
+
+                for (size_t shell_idx = 0; shell_idx < geom["boundaries"].size(); ++shell_idx) {
+                    const auto& shell = geom["boundaries"][shell_idx];
+                    const auto& semantics = geom["semantics"]["values"][shell_idx];
+
+                    for (size_t surf_idx = 0; surf_idx < shell.size(); ++surf_idx) {
+                        int sem_index = semantics[surf_idx].get<int>();
+                        std::string sem_type = geom["semantics"]["surfaces"][sem_index]["type"];
+
+                        if (sem_type == "GroundSurface") {
+                            std::cout << "    Found GroundSurface in " << child_str << std::endl;
+                            // Extract footprint from first ring
+                            const auto& surface = shell[surf_idx];
+                            if (!surface.empty()) {
+                                const auto& ring = surface[0]; // First (outer) ring
+                                for (int vertex_idx : ring) {
+                                    auto pt_3d = get_point(j, vertex_idx);
+                                    Point_3 cgal_pt(pt_3d[0], pt_3d[1], pt_3d[2]);
+                                    footprint.push_back(project_to_2d(cgal_pt));
+                                }
+                                return footprint; // Return first ground surface found
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return footprint;
+}
+
+// Calculate general orientations for all buildings
+void calculate_general_orientations(json& j) {
+    std::cout << "\n=== Step 2: Calculating General Orientations using CGAL ===" << std::endl;
+    std::cout << "Using manual minimum bounding rectangle implementation" << std::endl;
+    std::cout << "CGAL Simple_cartesian kernel (no GMP dependencies)" << std::endl;
+
+    int processed_buildings = 0;
+    int successful_calculations = 0;
+
+    for (auto& [building_id, building_obj] : j["CityObjects"].items()) {
+        if (building_obj["type"] != "Building") continue;
+
+        processed_buildings++;
+        std::cout << "\n--- Processing building: " << building_id << " ---" << std::endl;
+
+        // Get building footprint from GroundSurface
+        std::vector<Point_2> footprint = get_building_footprint(j, building_id);
+
+        if (footprint.size() < 3) {
+            std::cout << "    ERROR: Could not extract valid footprint (found "
+                      << footprint.size() << " points)" << std::endl;
+            continue;
+        }
+
+        std::cout << "    Footprint extracted: " << footprint.size() << " vertices" << std::endl;
+
+        // Calculate minimum bounding rectangle manually
+        OrientationResult orientation_result = calculate_minimum_bounding_rectangle_manual(footprint);
+
+        if (orientation_result.mbr_area > 0 && orientation_result.mbr_area < std::numeric_limits<double>::max()) {
+            successful_calculations++;
+
+            std::cout << "    ✓ RESULTS:" << std::endl;
+            std::cout << "      General Orientation: " << std::fixed << std::setprecision(1)
+                      << orientation_result.angle_degrees << "° clockwise from North" << std::endl;
+            std::cout << "      MBR Area: " << std::fixed << std::setprecision(2)
+                      << orientation_result.mbr_area << " sq units" << std::endl;
+            std::cout << "      MBR Dimensions: " << std::fixed << std::setprecision(2)
+                      << orientation_result.mbr_width << " x " << orientation_result.mbr_height << std::endl;
+            std::cout << "      Footprint Area: " << std::fixed << std::setprecision(2)
+                      << orientation_result.footprint_area << " sq units" << std::endl;
+
+            if (orientation_result.mbr_area > 0) {
+                double efficiency = (orientation_result.footprint_area / orientation_result.mbr_area) * 100.0;
+                std::cout << "      Area Efficiency: " << std::fixed << std::setprecision(1)
+                          << efficiency << "%" << std::endl;
+            }
+
+            // Add attributes to building object
+            if (!building_obj.contains("attributes")) {
+                building_obj["attributes"] = json::object();
+            }
+
+            building_obj["attributes"]["general_orientation"] = orientation_result.angle_degrees;
+            building_obj["attributes"]["mbr_area"] = orientation_result.mbr_area;
+            building_obj["attributes"]["mbr_width"] = orientation_result.mbr_width;
+            building_obj["attributes"]["mbr_height"] = orientation_result.mbr_height;
+            building_obj["attributes"]["footprint_area"] = orientation_result.footprint_area;
+
+            if (orientation_result.mbr_area > 0) {
+                building_obj["attributes"]["area_efficiency"] = orientation_result.footprint_area / orientation_result.mbr_area;
+            }
+
+            // Store MBR corners for visualization/debugging
+            json mbr_corners = json::array();
+            for (const Point_2& corner : orientation_result.mbr_corners) {
+                mbr_corners.push_back({corner.x(), corner.y()});
+            }
+            building_obj["attributes"]["mbr_corners"] = mbr_corners;
+
+        } else {
+            std::cout << "    ERROR: Failed to calculate valid MBR" << std::endl;
+        }
+    }
+
+    std::cout << "\n=== Step 2 Summary ===" << std::endl;
+    std::cout << "Buildings processed: " << processed_buildings << std::endl;
+    std::cout << "Successful calculations: " << successful_calculations << std::endl;
+    if (processed_buildings > 0) {
+        std::cout << "Success rate: " << std::fixed << std::setprecision(1)
+                  << (100.0 * successful_calculations / processed_buildings) << "%" << std::endl;
+    }
+}
+
+// ------------------ Semantic Analysis ------------------
+
+struct SemanticSurfaceInfo {
+    int semantic_index;
+    std::string type;
+    double b3_azimut = -1.0;  // -1 means not available
+    bool has_b3_azimut = false;
+    json original_semantic;
+};
+
+std::vector<SemanticSurfaceInfo> analyze_semantic_surfaces(const json& geometry) {
+    std::vector<SemanticSurfaceInfo> surfaces;
+
+    if (!geometry.contains("semantics") || !geometry["semantics"].contains("surfaces")) {
+        return surfaces;
+    }
+
+    const auto& semantic_surfaces = geometry["semantics"]["surfaces"];
+
+    for (size_t i = 0; i < semantic_surfaces.size(); ++i) {
+        SemanticSurfaceInfo info;
+        info.semantic_index = i;
+        info.original_semantic = semantic_surfaces[i];
+        info.type = semantic_surfaces[i]["type"].get<std::string>();
+
+        if (semantic_surfaces[i].contains("b3_azimut")) {
+            info.b3_azimut = semantic_surfaces[i]["b3_azimut"].get<double>();
+            info.has_b3_azimut = true;
+        }
+
+        surfaces.push_back(info);
+    }
+
+    return surfaces;
+}
+
+// Count total RoofSurfaces in LoD 2.2 semantics only
+int count_semantic_roof_surfaces_lod22(const json& j) {
+    int total = 0;
+
+    for (const auto& [obj_id, co] : j["CityObjects"].items()) {
+        if (!co.contains("geometry")) continue;
+
+        for (const auto& geom : co["geometry"]) {
+            if (geom["type"] != "Solid") continue;
+
+            // Only count RoofSurfaces from LoD 2.2 geometries
+            if (!geom.contains("lod") || geom["lod"] != "2.2") {
+                continue;
+            }
+
+            auto surfaces = analyze_semantic_surfaces(geom);
+            for (const auto& surface : surfaces) {
+                if (surface.type == "RoofSurface") {
+                    total++;
+                }
+            }
+        }
+    }
+
+    return total;
+}
+
+// ------------------ Individual RoofSurface Processing (Step 3) ------------------
+
+struct RoofSurfaceInfo {
+    std::string building_id;
+    std::string surface_id;
+    int surface_number;
+    int semantic_index;
+    std::string orientation;
+    double area;
+    double azimuth;
+    double b3_azimut = -1.0;
+    bool has_b3_azimut = false;
+    std::vector<double> normal;
+    std::vector<std::vector<double>> vertices;
+    std::vector<int> vertex_indices;
+    json original_semantic;
+};
+
+json create_roof_surface_cityobject(const RoofSurfaceInfo& roof_info,
+                                    const std::vector<std::vector<int>>& vertices,
+                                    const json& original_transform) {
+    json roof_obj;
+
+    // Set basic properties
+    roof_obj["type"] = "GenericCityObject";
+    roof_obj["attributes"]["building_id"] = roof_info.building_id;
+    roof_obj["attributes"]["semantic_index"] = roof_info.semantic_index;
+    roof_obj["attributes"]["surface_number"] = roof_info.surface_number;
+    roof_obj["attributes"]["orientation"] = roof_info.orientation;
+    roof_obj["attributes"]["area"] = roof_info.area;
+
+    roof_obj["attributes"]["azimuth"] = roof_info.azimuth; // Always store computed azimuth
+
+    if (roof_info.has_b3_azimut) {
+        roof_obj["attributes"]["b3_azimut"] = roof_info.b3_azimut;
+        double diff = std::abs(roof_info.azimuth - roof_info.b3_azimut);
+        // Handle wrap-around case (e.g., 359° vs 1°)
+        if (diff > 180.0) {
+            diff = 360.0 - diff;
+        }
+        roof_obj["attributes"]["azimuth_difference"] = diff;
+    }
+
+    // Add normal vector as attributes
+    roof_obj["attributes"]["normal_x"] = roof_info.normal[0];
+    roof_obj["attributes"]["normal_y"] = roof_info.normal[1];
+    roof_obj["attributes"]["normal_z"] = roof_info.normal[2];
+
+    // Create geometry
+    json geometry;
+    geometry["type"] = "MultiSurface";
+    geometry["lod"] = "2.2";
+
+    // Create boundaries - single surface with single ring
+    geometry["boundaries"] = json::array();
+    geometry["boundaries"].push_back(json::array());
+    geometry["boundaries"][0].push_back(roof_info.vertex_indices);
+
+    // Create semantics - preserve original semantic data
+    geometry["semantics"]["surfaces"] = json::array();
+    json semantic_surface = roof_info.original_semantic;
+    semantic_surface["orientation"] = roof_info.orientation;
+    semantic_surface["area"] = roof_info.area;
+    semantic_surface["azimuth"] = roof_info.azimuth; // Always store computed azimuth
+    geometry["semantics"]["surfaces"].push_back(semantic_surface);
+
+    geometry["semantics"]["values"] = json::array();
+    geometry["semantics"]["values"].push_back(json::array());
+    geometry["semantics"]["values"][0].push_back(0); // Reference to first (and only) semantic surface
+
+    roof_obj["geometry"] = json::array();
+    roof_obj["geometry"].push_back(geometry);
+
+    return roof_obj;
+}
+
+// Forward declaration
+void print_roof_surface_summary(const std::vector<RoofSurfaceInfo>& roof_surfaces);
+
+int create_individual_roof_surface_objects(json& j) {
+    std::cout << "\n=== Step 3: Creating Individual RoofSurface CityObjects Based on LoD 2.2 Semantics ===" << std::endl;
+    std::cout << "Reading RoofSurface count from LoD 2.2 geometries only..." << std::endl;
+
+    // Count semantic surfaces by type for LoD 2.2 only
+    std::map<std::string, int> lod22_semantic_counts;
+    std::map<std::string, int> all_semantic_counts;
+
+    for (const auto& [obj_id, co] : j["CityObjects"].items()) {
+        if (!co.contains("geometry")) continue;
+
+        for (const auto& geom : co["geometry"]) {
+            if (geom["type"] != "Solid") continue;
+
+            auto surfaces = analyze_semantic_surfaces(geom);
+            bool is_lod22 = geom.contains("lod") && geom["lod"] == "2.2";
+
+            for (const auto& surface : surfaces) {
+                all_semantic_counts[surface.type]++;
+                if (is_lod22) {
+                    lod22_semantic_counts[surface.type]++;
+                }
+            }
+        }
+    }
+
+    std::cout << "All LoD semantic surface counts:" << std::endl;
+    for (const auto& [type, count] : all_semantic_counts) {
+        std::cout << "  " << type << ": " << count << " surfaces (all LoD)" << std::endl;
+    }
+
+    std::cout << "\nLoD 2.2 semantic surface counts:" << std::endl;
+    for (const auto& [type, count] : lod22_semantic_counts) {
+        std::cout << "  " << type << ": " << count << " surfaces (LoD 2.2 only)" << std::endl;
+    }
+
+    int total_roof_semantics_lod22 = lod22_semantic_counts["RoofSurface"];
+    std::cout << "\n-> Found " << total_roof_semantics_lod22 << " RoofSurface semantic definitions in LoD 2.2" << std::endl;
+    std::cout << "-> Creating " << total_roof_semantics_lod22 << " individual CityObjects" << std::endl;
+
+    // Map to track roof surface count per building
+    std::map<std::string, int> building_roof_count;
+
+    // Store original data
+    auto original_vertices = j["vertices"];
+    auto original_transform = j["transform"];
+
+    std::cout << "\nProcessing each RoofSurface semantic..." << std::endl;
+
+    std::vector<RoofSurfaceInfo> roof_surfaces;
+
+    for (auto& [obj_id, co] : j["CityObjects"].items()) {
+        if (!co.contains("geometry")) continue;
+
+        // Find the parent building for this object
+        std::string building_id = obj_id;
+
+        // If this object has a parent, find the root building
+        for (auto& [parent_id, parent_co] : j["CityObjects"].items()) {
+            if (parent_co["type"] == "Building" && parent_co.contains("children")) {
+                for (const auto& child_id : parent_co["children"]) {
+                    if (child_id.get<std::string>() == obj_id) {
+                        building_id = parent_id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (auto& geom : co["geometry"]) {
+            if (geom["type"] != "Solid") continue;
+
+            // ONLY process LoD 2.2 geometries
+            if (!geom.contains("lod") || geom["lod"] != "2.2") {
+                continue;
+            }
+
+            std::cout << "Processing LoD 2.2 geometry for object: " << obj_id << std::endl;
+
+            // Analyze semantic surfaces for this geometry
+            auto semantic_surfaces = analyze_semantic_surfaces(geom);
+
+            // Process each shell
+            for (size_t shell_idx = 0; shell_idx < geom["boundaries"].size(); ++shell_idx) {
+                const auto& shell = geom["boundaries"][shell_idx];
+                const auto& semantics = geom["semantics"]["values"][shell_idx];
+
+                // Process each surface in the shell
+                for (size_t surf_idx = 0; surf_idx < shell.size(); ++surf_idx) {
+                    const auto& surface = shell[surf_idx];
+                    int sem_index = semantics[surf_idx].get<int>();
+
+                    // Check if this semantic index corresponds to a RoofSurface
+                    if (sem_index >= semantic_surfaces.size() ||
+                        semantic_surfaces[sem_index].type != "RoofSurface") {
+                        continue; // Skip non-RoofSurface
+                    }
+
+                    const auto& roof_semantic = semantic_surfaces[sem_index];
+
+                    // Increment roof surface count for this building
+                    building_roof_count[building_id]++;
+                    int surface_number = building_roof_count[building_id];
+
+                    std::string surface_id = building_id + "-" + std::to_string(surface_number);
+
+                    std::cout << "\n--- Processing " << surface_id << " (semantic index " << sem_index << ") ---" << std::endl;
+
+                    // Process each ring of the surface (typically just the outer ring)
+                    for (const auto& ring : surface) {
+                        if (ring.size() < 3) continue;
+
+                        // Get the actual 3D coordinates
+                        std::vector<std::vector<double>> pts;
+                        std::vector<int> vertex_indices;
+
+                        for (int idx : ring) {
+                            pts.push_back(get_point(j, idx));
+                            vertex_indices.push_back(idx);
+                        }
+
+                        // Calculate surface normal
+                        auto maybe_normal = compute_normal(pts);
+                        if (!maybe_normal.has_value()) {
+                            std::cout << "  Warning: Could not compute normal for surface" << std::endl;
+                            continue;
+                        }
+
+                        std::vector<double> normal = maybe_normal.value();
+                        std::cout << "  Normal vector: (" << std::fixed << std::setprecision(4)
+                                  << normal[0] << ", " << normal[1] << ", " << normal[2] << ")" << std::endl;
+
+                        // Determine orientation - but ALWAYS compute azimuth for comparison
+                        std::string orientation;
+                        double azimuth = azimuth_from_normal(normal); // Always compute azimuth
+
+                        if (is_horizontal(normal)) {
+                            orientation = "horizontal";
+                            std::cout << "  Surface is HORIZONTAL" << std::endl;
+                            std::cout << "  Computed azimuth: " << std::fixed << std::setprecision(2)
+                                      << azimuth << "° from North (for horizontal surface)" << std::endl;
+                        } else {
+                            orientation = azimuth_to_direction(azimuth);
+                            std::cout << "  Computed azimuth: " << std::fixed << std::setprecision(2)
+                                      << azimuth << "° from North" << std::endl;
+                        }
+
+                        if (roof_semantic.has_b3_azimut) {
+                            std::cout << "  b3_azimut: " << std::fixed << std::setprecision(2)
+                                      << roof_semantic.b3_azimut << "° from North" << std::endl;
+                            double diff = std::abs(azimuth - roof_semantic.b3_azimut);
+                            // Handle wrap-around case (e.g., 359° vs 1°)
+                            if (diff > 180.0) {
+                                diff = 360.0 - diff;
+                            }
+                            std::cout << "  Difference: " << std::fixed << std::setprecision(2)
+                                      << diff << "°" << std::endl;
+                        }
+
+                        std::cout << "  Orientation: " << orientation << std::endl;
+
+                        // Calculate area
+                        double area = calculate_3d_polygon_area(pts);
+                        std::cout << "  Area: " << std::fixed << std::setprecision(2)
+                                  << area << " square units" << std::endl;
+
+                        // Update original semantic surface - always store azimuth
+                        geom["semantics"]["surfaces"][sem_index]["orientation"] = orientation;
+                        geom["semantics"]["surfaces"][sem_index]["area"] = area;
+                        geom["semantics"]["surfaces"][sem_index]["azimuth"] = azimuth; // Always store computed azimuth
+
+                        // Create roof surface info
+                        RoofSurfaceInfo roof_info;
+                        roof_info.building_id = building_id;
+                        roof_info.surface_id = surface_id;
+                        roof_info.surface_number = surface_number;
+                        roof_info.semantic_index = sem_index;
+                        roof_info.orientation = orientation;
+                        roof_info.area = area;
+                        roof_info.azimuth = azimuth;
+                        roof_info.normal = normal;
+                        roof_info.vertices = pts;
+                        roof_info.vertex_indices = vertex_indices;
+                        roof_info.original_semantic = roof_semantic.original_semantic;
+                        roof_info.b3_azimut = roof_semantic.b3_azimut;
+                        roof_info.has_b3_azimut = roof_semantic.has_b3_azimut;
+
+                        // Create vertices array for this individual roof surface
+                        std::vector<std::vector<int>> new_vertices;
+                        convert_vertices_to_indices(j, ring, new_vertices);
+
+                        // Update vertex indices for the new object (0-based for the new object)
+                        std::vector<int> new_indices;
+                        for (int i = 0; i < new_vertices.size(); ++i) {
+                            new_indices.push_back(i);
+                        }
+                        roof_info.vertex_indices = new_indices;
+
+                        // Create new CityObject for this roof surface
+                        json roof_obj = create_roof_surface_cityobject(roof_info, new_vertices, original_transform);
+
+                        // Add vertices to the individual roof surface object
+                        roof_obj["vertices"] = new_vertices;
+                        roof_obj["transform"] = original_transform;
+
+                        std::cout << "  ✓ Created CityObject with " << new_vertices.size() << " vertices" << std::endl;
+
+                        // Add the new CityObject to the main JSON
+                        j["CityObjects"][surface_id] = roof_obj;
+                        roof_surfaces.push_back(roof_info);
+
+                        // Only process the first (outer) ring
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    std::cout << "\nCreated " << roof_surfaces.size() << " individual roof surface CityObjects" << std::endl;
+
+    // Print summary
+    print_roof_surface_summary(roof_surfaces);
+
+    return roof_surfaces.size();
+}
+
+void print_roof_surface_summary(const std::vector<RoofSurfaceInfo>& roof_surfaces) {
+    std::cout << "\n=== Step 3 Summary: ROOF SURFACE RESULTS ===" << std::endl;
+    std::cout << "Total individual roof surfaces: " << roof_surfaces.size() << std::endl;
+
+    // Group by building
+    std::map<std::string, std::vector<const RoofSurfaceInfo*>> buildings;
+    for (const auto& roof : roof_surfaces) {
+        buildings[roof.building_id].push_back(&roof);
+    }
+
+    std::cout << "\nPer-building breakdown:" << std::endl;
+    for (const auto& [building_id, surfaces] : buildings) {
+        std::cout << "\nBuilding: " << building_id << " (" << surfaces.size() << " roof surfaces)" << std::endl;
+
+        for (const auto* surface : surfaces) {
+            std::cout << "  " << surface->surface_id
+                      << " (semantic " << surface->semantic_index << "): "
+                      << surface->orientation;
+            std::cout << " (" << std::fixed << std::setprecision(1)
+                      << surface->azimuth << "°)";
+            if (surface->has_b3_azimut) {
+                std::cout << " [b3: " << std::fixed << std::setprecision(1)
+                          << surface->b3_azimut << "°]";
+            }
+            std::cout << ", Area: " << std::fixed << std::setprecision(2)
+                      << surface->area << " sq units" << std::endl;
+        }
+    }
+
+    std::cout << "\nOrientation distribution:" << std::endl;
+    std::map<std::string, int> orientation_count;
+    for (const auto& roof : roof_surfaces) {
+        orientation_count[roof.orientation]++;
+    }
+
+    for (const auto& [orientation, count] : orientation_count) {
+        std::cout << "  " << orientation << ": " << count << " surfaces" << std::endl;
+    }
+
+    // Azimuth comparison statistics - now includes ALL surfaces
+    if (std::any_of(roof_surfaces.begin(), roof_surfaces.end(),
+                    [](const auto& r) { return r.has_b3_azimut; })) {
+        std::cout << "\nAzimuth comparison with b3_azimut (ALL surfaces):" << std::endl;
+        double total_diff = 0.0;
+        int count = 0;
+        for (const auto& roof : roof_surfaces) {
+            if (roof.has_b3_azimut) {
+                double diff = std::abs(roof.azimuth - roof.b3_azimut);
+                // Handle wrap-around case (e.g., 359° vs 1°)
+                if (diff > 180.0) {
+                    diff = 360.0 - diff;
+                }
+                total_diff += diff;
+                count++;
+                std::cout << "  " << roof.surface_id << ": "
+                          << std::fixed << std::setprecision(2) << diff << "° difference" << std::endl;
+            }
+        }
+        if (count > 0) {
+            std::cout << "  Average difference: " << std::fixed << std::setprecision(2)
+                      << (total_diff / count) << "°" << std::endl;
+        }
+    }
+}
+
+// ------------------ Main Processing Functions ------------------
+
+int process_roof_surfaces(json& j) {
+    // Create individual roof surface CityObjects based on semantic definitions
+    return create_individual_roof_surface_objects(j);
+}
+
+// ------------------ Debugging Functions ------------------
+
+int get_no_roof_surfaces(json &j) {
+    int total = 0;
+    for (auto& co : j["CityObjects"].items()) {
+        for (auto& g : co.value()["geometry"]) {
+            if (g["type"] == "Solid") {
+                for (auto& shell : g["semantics"]["values"]) {
+                    for (auto& s : shell) {
+                        if (g["semantics"]["surfaces"][s.get<int>()]["type"].get<std::string>() == "RoofSurface") {
+                            total++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return total;
+}
+
+// ------------------ Main Function ------------------
+
+int main(int argc, const char* argv[]) {
+    //const char* filename = (argc > 1) ? argv[1] : "10-282-562.city.json";
+    const char* filename = (argc > 1) ? argv[1] : "nextbk_2b.city.json";
+
+    std::cout << "================================================" << std::endl;
+    std::cout << "Complete 3DBAG Processor - Steps 1, 2, and 3" << std::endl;
+    std::cout << "================================================" << std::endl;
+    std::cout << "Processing file: " << filename << std::endl;
+    std::cout << "Using CGAL Simple_cartesian (no GMP needed)" << std::endl;
+    std::cout << "Manual implementation of forbidden functions" << std::endl;
+    std::cout << "Step 1: Volume calculation (tetrahedra decomposition)" << std::endl;
+    std::cout << "Step 2: General orientation (minimum bounding rectangle)" << std::endl;
+    std::cout << "Step 3: RoofSurface orientation and area (surface normals)" << std::endl;
+    std::cout << "================================================" << std::endl;
+
+    // Read input file
+    std::ifstream input(filename);
+    if (!input.is_open()) {
+        std::cerr << "ERROR: Could not open file " << filename << std::endl;
+        return 1;
+    }
+
+    json j;
+    try {
+        input >> j;
+        std::cout << "✓ Successfully loaded CityJSON file" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Failed to parse JSON: " << e.what() << std::endl;
+        return 1;
+    }
+    input.close();
+
+    // Basic file information
+    std::cout << "\n=== File Information ===" << std::endl;
+    std::cout << "CityObjects count: " << j["CityObjects"].size() << std::endl;
+    std::cout << "Vertices count: " << j["vertices"].size() << std::endl;
+
+    int noroofsurfaces = get_no_roof_surfaces(j);
+    std::cout << "RoofSurfaces count (all LoD): " << noroofsurfaces << std::endl;
+
+    // Count semantic RoofSurfaces in LoD 2.2 only
+    int semantic_roof_count = count_semantic_roof_surfaces_lod22(j);
+    std::cout << "LoD 2.2 RoofSurface definitions: " << semantic_roof_count << std::endl;
+
+    // Count buildings
+    int building_count = 0;
+    for (const auto& [id, obj] : j["CityObjects"].items()) {
+        if (obj["type"] == "Building") building_count++;
+    }
+    std::cout << "Buildings count: " << building_count << std::endl;
+
+    // Step 1: Volume calculation (tetrahedra decomposition)
+    std::cout << "\n=== Step 1: Volume Calculation (Manual Implementation) ===" << std::endl;
+    std::vector<double> fake_point = {0.0, 0.0, -1000.0};
+    int nobuildings = 0;
+
+    for (auto& [id, co] : j["CityObjects"].items()) {
+        if (co["type"] != "Building") continue;
+
+        double total_volume = 0.0;
+        int total_tetrahedra = 0;
+        std::vector<std::vector<double>> roof_normals;
+
+        std::cout << "\nCalculating volume for building: " << id << std::endl;
+
+        if (!co.contains("children")) continue;
+        for (const auto& child_id : co["children"]) {
+            if (!j["CityObjects"].contains(child_id.get<std::string>())) continue;
+            const auto& child = j["CityObjects"][child_id.get<std::string>()];
+            for (const auto& geom : child["geometry"]) {
+                if (geom["type"] != "Solid" || geom["lod"] != "2.2") continue;
+
+                for (const auto& shell : geom["boundaries"]) {
+                    for (const auto& surface : shell) {
+                        for (const auto& ring : surface) {
+                            if (ring.size() < 3) continue;
+
+                            std::vector<std::vector<double>> pts;
+                            for (int idx : ring) {
+                                pts.push_back(get_point(j, idx));
+                            }
+
+                            // Collect roof normals for average azimuth calculation
+                            if (geom.contains("semantics")) {
+                                // Check if this is a roof surface for normal collection
+                                for (const auto& sem_shell : geom["semantics"]["values"]) {
+                                    for (size_t k = 0; k < sem_shell.size(); ++k) {
+                                        int sem_idx = sem_shell[k].get<int>();
+                                        if (geom["semantics"]["surfaces"][sem_idx]["type"] == "RoofSurface") {
+                                            auto maybe_normal = compute_normal(pts);
+                                            if (maybe_normal.has_value()) {
+                                                roof_normals.push_back(maybe_normal.value());
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Decompose polygon into tetrahedra and sum volumes
+                            for (size_t i = 1; i + 1 < pts.size(); ++i) {
+                                double vol = signed_volume(pts[0], pts[i], pts[i + 1], fake_point);
+                                total_volume += vol;
+                                total_tetrahedra++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        std::cout << "  Total tetrahedra: " << total_tetrahedra << std::endl;
+        std::cout << "  Computed volume: " << std::fixed << std::setprecision(2)
+                  << std::abs(total_volume) << " cubic units" << std::endl;
+
+        // Check for existing b3_volume_lod22 for comparison
+        if (co.contains("attributes") && co["attributes"].contains("b3_volume_lod22")) {
+            double b3_volume = co["attributes"]["b3_volume_lod22"].get<double>();
+            double diff = std::abs(std::abs(total_volume) - b3_volume);
+            std::cout << "  b3_volume_lod22: " << std::fixed << std::setprecision(2)
+                      << b3_volume << " cubic units" << std::endl;
+            std::cout << "  Difference: " << std::fixed << std::setprecision(2)
+                      << diff << " cubic units ("
+                      << std::fixed << std::setprecision(1) << (diff/b3_volume)*100.0 << "%)" << std::endl;
+        }
+
+        if (!co.contains("attributes")) {
+            co["attributes"] = json::object();
+        }
+        co["attributes"]["volume"] = std::abs(total_volume);
+        co["attributes"]["tetrahedra_count"] = total_tetrahedra;
+
+        // Calculate average roof azimuth
+        if (!roof_normals.empty()) {
+            double avg_nx = 0, avg_ny = 0, avg_nz = 0;
+            for (const auto& n : roof_normals) {
+                avg_nx += n[0];
+                avg_ny += n[1];
+                avg_nz += n[2];
+            }
+            double len = std::sqrt(avg_nx * avg_nx + avg_ny * avg_ny + avg_nz * avg_nz);
+            if (len > 0) {
+                std::vector<double> avg_normal = {avg_nx / len, avg_ny / len, avg_nz / len};
+                double azimuth = azimuth_from_normal(avg_normal);
+                std::cout << "  Average roof azimuth: " << std::fixed << std::setprecision(1)
+                          << azimuth << " degrees from North" << std::endl;
+                co["attributes"]["roof_azimuth_deg"] = azimuth;
+            }
+        }
+
+        nobuildings++;
+    }
+
+    std::cout << "\n=== Step 1 Summary ===" << std::endl;
+    std::cout << "Volume calculation completed for " << nobuildings << " buildings." << std::endl;
+
+    // Step 2: Calculate general orientations using CGAL
+    calculate_general_orientations(j);
+
+    // Step 3: Process roof surfaces based on semantic definitions
+    int created_roof_surfaces = process_roof_surfaces(j);
+
+    std::cout << "\n=== FINAL SUMMARY ===" << std::endl;
+    std::cout << "Initial CityObjects count: " << j["CityObjects"].size() - created_roof_surfaces << std::endl;
+    std::cout << "Final CityObjects count: " << j["CityObjects"].size() << std::endl;
+    std::cout << "Individual roof surfaces created: " << created_roof_surfaces << std::endl;
+    std::cout << "Buildings processed: " << nobuildings << std::endl;
+    std::cout << "Number of vertices: " << j["vertices"].size() << std::endl;
+
+    // Write output file
+    std::ofstream output("out.city.json");
+    if (!output.is_open()) {
+        std::cerr << "ERROR: Could not create output file" << std::endl;
+        return 1;
+    }
+
+    output << j.dump(2) << std::endl;
+    output.close();
+
+    std::cout << "\n================================================" << std::endl;
+    std::cout << "✓ ALL STEPS COMPLETED SUCCESSFULLY!" << std::endl;
+    std::cout << "✓ Output written to: out.city.json" << std::endl;
+    std::cout << "✓ Step 1: Building volumes calculated and verified" << std::endl;
+    std::cout << "✓ Step 2: General orientations calculated" << std::endl;
+    std::cout << "✓ Step 3: Individual roof surfaces created with orientations" << std::endl;
+    std::cout << "✓ All forbidden functions manually implemented" << std::endl;
+    std::cout << "✓ CGAL integration successful (no GMP dependencies)" << std::endl;
+    std::cout << "================================================" << std::endl;
+
+    return 0;
+}

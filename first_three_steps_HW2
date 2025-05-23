@@ -6,6 +6,9 @@
 #include <iomanip>
 #include <optional>
 #include <algorithm>
+#include <map>
+#include <sstream>
+#include <set>
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -99,18 +102,6 @@ std::string azimuth_to_direction(double azimuth) {
     else return "N"; // fallback
 }
 
-// Calculate polygon area using shoelace formula
-double calculate_polygon_area(const std::vector<std::vector<double>>& pts) {
-    if (pts.size() < 3) return 0.0;
-
-    double area = 0.0;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        size_t j = (i + 1) % pts.size();
-        area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
-    }
-    return std::abs(area) * 0.5;
-}
-
 // Calculate 3D polygon area using cross product method
 double calculate_3d_polygon_area(const std::vector<std::vector<double>>& pts) {
     if (pts.size() < 3) return 0.0;
@@ -144,77 +135,255 @@ double calculate_3d_polygon_area(const std::vector<std::vector<double>>& pts) {
     return magnitude * 0.5;
 }
 
-// ------------------ Introspection Helpers ------------------
+// Convert vertex indices to scaled coordinates for new CityObject
+std::vector<std::vector<int>> convert_vertices_to_indices(const json& j,
+                                                          const std::vector<int>& ring,
+                                                          std::vector<std::vector<int>>& new_vertices) {
+    std::vector<int> new_ring;
 
-int get_no_roof_surfaces(json &j) {
+    for (int old_idx : ring) {
+        // Get the original vertex
+        std::vector<int> vertex = j["vertices"][old_idx];
+
+        // Check if we already have this vertex in our new list
+        int new_idx = -1;
+        for (size_t i = 0; i < new_vertices.size(); ++i) {
+            if (new_vertices[i] == vertex) {
+                new_idx = i;
+                break;
+            }
+        }
+
+        // If not found, add it
+        if (new_idx == -1) {
+            new_vertices.push_back(vertex);
+            new_idx = new_vertices.size() - 1;
+        }
+
+        new_ring.push_back(new_idx);
+    }
+
+    return {new_ring};
+}
+
+// ------------------ Semantic Analysis ------------------
+
+struct SemanticSurfaceInfo {
+    int semantic_index;
+    std::string type;
+    double b3_azimut = -1.0;  // -1 means not available
+    bool has_b3_azimut = false;
+    json original_semantic;
+};
+
+std::vector<SemanticSurfaceInfo> analyze_semantic_surfaces(const json& geometry) {
+    std::vector<SemanticSurfaceInfo> surfaces;
+
+    if (!geometry.contains("semantics") || !geometry["semantics"].contains("surfaces")) {
+        return surfaces;
+    }
+
+    const auto& semantic_surfaces = geometry["semantics"]["surfaces"];
+
+    for (size_t i = 0; i < semantic_surfaces.size(); ++i) {
+        SemanticSurfaceInfo info;
+        info.semantic_index = i;
+        info.original_semantic = semantic_surfaces[i];
+        info.type = semantic_surfaces[i]["type"].get<std::string>();
+
+        if (semantic_surfaces[i].contains("b3_azimut")) {
+            info.b3_azimut = semantic_surfaces[i]["b3_azimut"].get<double>();
+            info.has_b3_azimut = true;
+        }
+
+        surfaces.push_back(info);
+    }
+
+    return surfaces;
+}
+
+// Count total RoofSurfaces in LoD 2.2 semantics only
+int count_semantic_roof_surfaces_lod22(const json& j) {
     int total = 0;
-    for (auto& co : j["CityObjects"].items()) {
-        for (auto& g : co.value()["geometry"]) {
-            if (g["type"] == "Solid") {
-                for (auto& shell : g["semantics"]["values"]) {
-                    for (auto& s : shell) {
-                        if (g["semantics"]["surfaces"][s.get<int>()]["type"].get<std::string>() == "RoofSurface") {
-                            total++;
-                        }
-                    }
+
+    for (const auto& [obj_id, co] : j["CityObjects"].items()) {
+        if (!co.contains("geometry")) continue;
+
+        for (const auto& geom : co["geometry"]) {
+            if (geom["type"] != "Solid") continue;
+
+            // Only count RoofSurfaces from LoD 2.2 geometries
+            if (!geom.contains("lod") || geom["lod"] != "2.2") {
+                continue;
+            }
+
+            auto surfaces = analyze_semantic_surfaces(geom);
+            for (const auto& surface : surfaces) {
+                if (surface.type == "RoofSurface") {
+                    total++;
                 }
             }
         }
     }
+
     return total;
 }
 
-void visit_roofsurfaces(json &j) {
-    for (auto& co : j["CityObjects"].items()) {
-        for (auto& g : co.value()["geometry"]) {
-            if (g["type"] == "Solid") {
-                for (int i = 0; i < g["boundaries"].size(); i++) {
-                    for (int j = 0; j < g["boundaries"][i].size(); j++) {
-                        int sem_index = g["semantics"]["values"][i][j];
-                        if (g["semantics"]["surfaces"][sem_index]["type"].get<std::string>() == "RoofSurface") {
-                            std::cout << "RoofSurface: " << g["boundaries"][i][j] << std::endl;
-                        }
-                    }
+// ------------------ Individual RoofSurface Processing ------------------
+
+struct RoofSurfaceInfo {
+    std::string building_id;
+    std::string surface_id;
+    int surface_number;
+    int semantic_index;
+    std::string orientation;
+    double area;
+    double azimuth;
+    double b3_azimut = -1.0;
+    bool has_b3_azimut = false;
+    std::vector<double> normal;
+    std::vector<std::vector<double>> vertices;
+    std::vector<int> vertex_indices;
+    json original_semantic;
+};
+
+json create_roof_surface_cityobject(const RoofSurfaceInfo& roof_info,
+                                    const std::vector<std::vector<int>>& vertices,
+                                    const json& original_transform) {
+    json roof_obj;
+
+    // Set basic properties
+    roof_obj["type"] = "GenericCityObject";
+    roof_obj["attributes"]["building_id"] = roof_info.building_id;
+    roof_obj["attributes"]["semantic_index"] = roof_info.semantic_index;
+    roof_obj["attributes"]["surface_number"] = roof_info.surface_number;
+    roof_obj["attributes"]["orientation"] = roof_info.orientation;
+    roof_obj["attributes"]["area"] = roof_info.area;
+
+    roof_obj["attributes"]["azimuth"] = roof_info.azimuth; // Always store computed azimuth
+
+    if (roof_info.has_b3_azimut) {
+        roof_obj["attributes"]["b3_azimut"] = roof_info.b3_azimut;
+        double diff = std::abs(roof_info.azimuth - roof_info.b3_azimut);
+        // Handle wrap-around case (e.g., 359° vs 1°)
+        if (diff > 180.0) {
+            diff = 360.0 - diff;
+        }
+        roof_obj["attributes"]["azimuth_difference"] = diff;
+    }
+
+    // Add normal vector as attributes
+    roof_obj["attributes"]["normal_x"] = roof_info.normal[0];
+    roof_obj["attributes"]["normal_y"] = roof_info.normal[1];
+    roof_obj["attributes"]["normal_z"] = roof_info.normal[2];
+
+    // Create geometry
+    json geometry;
+    geometry["type"] = "MultiSurface";
+    geometry["lod"] = "2.2";
+
+    // Create boundaries - single surface with single ring
+    geometry["boundaries"] = json::array();
+    geometry["boundaries"].push_back(json::array());
+    geometry["boundaries"][0].push_back(roof_info.vertex_indices);
+
+    // Create semantics - preserve original semantic data
+    geometry["semantics"]["surfaces"] = json::array();
+    json semantic_surface = roof_info.original_semantic;
+    semantic_surface["orientation"] = roof_info.orientation;
+    semantic_surface["area"] = roof_info.area;
+    semantic_surface["azimuth"] = roof_info.azimuth; // Always store computed azimuth
+    geometry["semantics"]["surfaces"].push_back(semantic_surface);
+
+    geometry["semantics"]["values"] = json::array();
+    geometry["semantics"]["values"].push_back(json::array());
+    geometry["semantics"]["values"][0].push_back(0); // Reference to first (and only) semantic surface
+
+    roof_obj["geometry"] = json::array();
+    roof_obj["geometry"].push_back(geometry);
+
+    return roof_obj;
+}
+
+void create_individual_roof_surface_objects(json& j, std::vector<RoofSurfaceInfo>& roof_surfaces) {
+    std::cout << "\n=== Creating Individual RoofSurface CityObjects Based on LoD 2.2 Semantics ===" << std::endl;
+    std::cout << "Reading RoofSurface count from LoD 2.2 geometries only..." << std::endl;
+
+    // Count semantic surfaces by type for LoD 2.2 only
+    std::map<std::string, int> lod22_semantic_counts;
+    std::map<std::string, int> all_semantic_counts;
+
+    for (const auto& [obj_id, co] : j["CityObjects"].items()) {
+        if (!co.contains("geometry")) continue;
+
+        for (const auto& geom : co["geometry"]) {
+            if (geom["type"] != "Solid") continue;
+
+            auto surfaces = analyze_semantic_surfaces(geom);
+            bool is_lod22 = geom.contains("lod") && geom["lod"] == "2.2";
+
+            for (const auto& surface : surfaces) {
+                all_semantic_counts[surface.type]++;
+                if (is_lod22) {
+                    lod22_semantic_counts[surface.type]++;
                 }
             }
         }
     }
-}
 
-void list_all_vertices(const json& j) {
-    for (const auto& co : j["CityObjects"].items()) {
-        std::cout << "= CityObject: " << co.key() << std::endl;
-        for (const auto& g : co.value()["geometry"]) {
-            if (g["type"] == "Solid") {
-                for (const auto& shell : g["boundaries"]) {
-                    for (const auto& surface : shell) {
-                        for (const auto& ring : surface) {
-                            std::cout << "---" << std::endl;
-                            for (const auto& v : ring) {
-                                std::vector<int> vi = j["vertices"][v.get<int>()];
-                                double x = vi[0] * j["transform"]["scale"][0].get<double>() + j["transform"]["translate"][0].get<double>();
-                                double y = vi[1] * j["transform"]["scale"][1].get<double>() + j["transform"]["translate"][1].get<double>();
-                                double z = vi[2] * j["transform"]["scale"][2].get<double>() + j["transform"]["translate"][2].get<double>();
-                                std::cout << std::setprecision(2) << std::fixed << v << " (" << x << ", " << y << ", " << z << ")" << std::endl;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    std::cout << "All LoD semantic surface counts:" << std::endl;
+    for (const auto& [type, count] : all_semantic_counts) {
+        std::cout << "  " << type << ": " << count << " surfaces (all LoD)" << std::endl;
     }
-}
 
-// ------------------ Main Processing Functions ------------------
+    std::cout << "\nLoD 2.2 semantic surface counts:" << std::endl;
+    for (const auto& [type, count] : lod22_semantic_counts) {
+        std::cout << "  " << type << ": " << count << " surfaces (LoD 2.2 only)" << std::endl;
+    }
 
-void process_roof_surfaces(json& j) {
-    int processed_surfaces = 0;
+    int total_roof_semantics_lod22 = lod22_semantic_counts["RoofSurface"];
+    std::cout << "\n-> Found " << total_roof_semantics_lod22 << " RoofSurface semantic definitions in LoD 2.2" << std::endl;
+    std::cout << "-> Creating " << total_roof_semantics_lod22 << " individual CityObjects" << std::endl;
 
-    std::cout << "\n=== Processing RoofSurfaces for Orientation and Area ===" << std::endl;
+    // Map to track roof surface count per building
+    std::map<std::string, int> building_roof_count;
+
+    // Store original data
+    auto original_vertices = j["vertices"];
+    auto original_transform = j["transform"];
+
+    std::cout << "\nProcessing each RoofSurface semantic..." << std::endl;
 
     for (auto& [obj_id, co] : j["CityObjects"].items()) {
+        if (!co.contains("geometry")) continue;
+
+        // Find the parent building for this object
+        std::string building_id = obj_id;
+
+        // If this object has a parent, find the root building
+        for (auto& [parent_id, parent_co] : j["CityObjects"].items()) {
+            if (parent_co["type"] == "Building" && parent_co.contains("children")) {
+                for (const auto& child_id : parent_co["children"]) {
+                    if (child_id.get<std::string>() == obj_id) {
+                        building_id = parent_id;
+                        break;
+                    }
+                }
+            }
+        }
+
         for (auto& geom : co["geometry"]) {
             if (geom["type"] != "Solid") continue;
+
+            // ONLY process LoD 2.2 geometries
+            if (!geom.contains("lod") || geom["lod"] != "2.2") {
+                continue;
+            }
+
+            std::cout << "Processing LoD 2.2 geometry for object: " << obj_id << std::endl;
+
+            // Analyze semantic surfaces for this geometry
+            auto semantic_surfaces = analyze_semantic_surfaces(geom);
 
             // Process each shell
             for (size_t shell_idx = 0; shell_idx < geom["boundaries"].size(); ++shell_idx) {
@@ -226,14 +395,21 @@ void process_roof_surfaces(json& j) {
                     const auto& surface = shell[surf_idx];
                     int sem_index = semantics[surf_idx].get<int>();
 
-                    // Check if this is a RoofSurface
-                    if (geom["semantics"]["surfaces"][sem_index]["type"].get<std::string>() != "RoofSurface") {
-                        continue;
+                    // Check if this semantic index corresponds to a RoofSurface
+                    if (sem_index >= semantic_surfaces.size() ||
+                        semantic_surfaces[sem_index].type != "RoofSurface") {
+                        continue; // Skip non-RoofSurface
                     }
 
-                    processed_surfaces++;
-                    std::cout << "Processing RoofSurface #" << processed_surfaces
-                              << " in object: " << obj_id << std::endl;
+                    const auto& roof_semantic = semantic_surfaces[sem_index];
+
+                    // Increment roof surface count for this building
+                    building_roof_count[building_id]++;
+                    int surface_number = building_roof_count[building_id];
+
+                    std::string surface_id = building_id + "-" + std::to_string(surface_number);
+
+                    std::cout << "\n--- Processing " << surface_id << " (semantic index " << sem_index << ") ---" << std::endl;
 
                     // Process each ring of the surface (typically just the outer ring)
                     for (const auto& ring : surface) {
@@ -241,8 +417,11 @@ void process_roof_surfaces(json& j) {
 
                         // Get the actual 3D coordinates
                         std::vector<std::vector<double>> pts;
+                        std::vector<int> vertex_indices;
+
                         for (int idx : ring) {
                             pts.push_back(get_point(j, idx));
+                            vertex_indices.push_back(idx);
                         }
 
                         // Calculate surface normal
@@ -253,18 +432,34 @@ void process_roof_surfaces(json& j) {
                         }
 
                         std::vector<double> normal = maybe_normal.value();
-                        std::cout << "  Normal vector: (" << normal[0] << ", "
-                                  << normal[1] << ", " << normal[2] << ")" << std::endl;
+                        std::cout << "  Normal vector: (" << std::fixed << std::setprecision(4)
+                                  << normal[0] << ", " << normal[1] << ", " << normal[2] << ")" << std::endl;
 
-                        // Determine orientation
+                        // Determine orientation - but ALWAYS compute azimuth for comparison
                         std::string orientation;
+                        double azimuth = azimuth_from_normal(normal); // Always compute azimuth
+
                         if (is_horizontal(normal)) {
                             orientation = "horizontal";
+                            std::cout << "  Surface is HORIZONTAL" << std::endl;
+                            std::cout << "  Computed azimuth: " << std::fixed << std::setprecision(2)
+                                      << azimuth << "° from North (for horizontal surface)" << std::endl;
                         } else {
-                            double azimuth = azimuth_from_normal(normal);
                             orientation = azimuth_to_direction(azimuth);
-                            std::cout << "  Azimuth: " << std::fixed << std::setprecision(1)
-                                      << azimuth << " degrees" << std::endl;
+                            std::cout << "  Computed azimuth: " << std::fixed << std::setprecision(2)
+                                      << azimuth << "° from North" << std::endl;
+                        }
+
+                        if (roof_semantic.has_b3_azimut) {
+                            std::cout << "  b3_azimut: " << std::fixed << std::setprecision(2)
+                                      << roof_semantic.b3_azimut << "° from North" << std::endl;
+                            double diff = std::abs(azimuth - roof_semantic.b3_azimut);
+                            // Handle wrap-around case (e.g., 359° vs 1°)
+                            if (diff > 180.0) {
+                                diff = 360.0 - diff;
+                            }
+                            std::cout << "  Difference: " << std::fixed << std::setprecision(2)
+                                      << diff << "°" << std::endl;
                         }
 
                         std::cout << "  Orientation: " << orientation << std::endl;
@@ -274,13 +469,52 @@ void process_roof_surfaces(json& j) {
                         std::cout << "  Area: " << std::fixed << std::setprecision(2)
                                   << area << " square units" << std::endl;
 
-                        // Add orientation and area to the semantic surface
+                        // Update original semantic surface - always store azimuth
                         geom["semantics"]["surfaces"][sem_index]["orientation"] = orientation;
                         geom["semantics"]["surfaces"][sem_index]["area"] = area;
+                        geom["semantics"]["surfaces"][sem_index]["azimuth"] = azimuth; // Always store computed azimuth
 
-                        std::cout << "  Updated semantic surface with orientation and area" << std::endl;
+                        // Create roof surface info
+                        RoofSurfaceInfo roof_info;
+                        roof_info.building_id = building_id;
+                        roof_info.surface_id = surface_id;
+                        roof_info.surface_number = surface_number;
+                        roof_info.semantic_index = sem_index;
+                        roof_info.orientation = orientation;
+                        roof_info.area = area;
+                        roof_info.azimuth = azimuth;
+                        roof_info.normal = normal;
+                        roof_info.vertices = pts;
+                        roof_info.vertex_indices = vertex_indices;
+                        roof_info.original_semantic = roof_semantic.original_semantic;
+                        roof_info.b3_azimut = roof_semantic.b3_azimut;
+                        roof_info.has_b3_azimut = roof_semantic.has_b3_azimut;
 
-                        // Only process the first (outer) ring for now
+                        // Create vertices array for this individual roof surface
+                        std::vector<std::vector<int>> new_vertices;
+                        convert_vertices_to_indices(j, ring, new_vertices);
+
+                        // Update vertex indices for the new object (0-based for the new object)
+                        std::vector<int> new_indices;
+                        for (int i = 0; i < new_vertices.size(); ++i) {
+                            new_indices.push_back(i);
+                        }
+                        roof_info.vertex_indices = new_indices;
+
+                        // Create new CityObject for this roof surface
+                        json roof_obj = create_roof_surface_cityobject(roof_info, new_vertices, original_transform);
+
+                        // Add vertices to the individual roof surface object
+                        roof_obj["vertices"] = new_vertices;
+                        roof_obj["transform"] = original_transform;
+
+                        std::cout << "  ✓ Created CityObject with " << new_vertices.size() << " vertices" << std::endl;
+
+                        // Add the new CityObject to the main JSON
+                        j["CityObjects"][surface_id] = roof_obj;
+                        roof_surfaces.push_back(roof_info);
+
+                        // Only process the first (outer) ring
                         break;
                     }
                 }
@@ -288,14 +522,95 @@ void process_roof_surfaces(json& j) {
         }
     }
 
-    std::cout << "\nTotal RoofSurfaces processed: " << processed_surfaces << std::endl;
+    std::cout << "\nCreated " << roof_surfaces.size() << " individual roof surface CityObjects" << std::endl;
+}
+
+void print_roof_surface_summary(const std::vector<RoofSurfaceInfo>& roof_surfaces) {
+    std::cout << "\n=== ROOF SURFACE SUMMARY ===" << std::endl;
+    std::cout << "Total individual roof surfaces: " << roof_surfaces.size() << std::endl;
+
+    // Group by building
+    std::map<std::string, std::vector<const RoofSurfaceInfo*>> buildings;
+    for (const auto& roof : roof_surfaces) {
+        buildings[roof.building_id].push_back(&roof);
+    }
+
+    std::cout << "\nPer-building breakdown:" << std::endl;
+    for (const auto& [building_id, surfaces] : buildings) {
+        std::cout << "\nBuilding: " << building_id << " (" << surfaces.size() << " roof surfaces)" << std::endl;
+
+        for (const auto* surface : surfaces) {
+            std::cout << "  " << surface->surface_id
+                      << " (semantic " << surface->semantic_index << "): "
+                      << surface->orientation;
+            std::cout << " (" << std::fixed << std::setprecision(1)
+                      << surface->azimuth << "°)";
+            if (surface->has_b3_azimut) {
+                std::cout << " [b3: " << std::fixed << std::setprecision(1)
+                          << surface->b3_azimut << "°]";
+            }
+            std::cout << ", Area: " << std::fixed << std::setprecision(2)
+                      << surface->area << " sq units" << std::endl;
+        }
+    }
+
+    std::cout << "\nOrientation distribution:" << std::endl;
+    std::map<std::string, int> orientation_count;
+    for (const auto& roof : roof_surfaces) {
+        orientation_count[roof.orientation]++;
+    }
+
+    for (const auto& [orientation, count] : orientation_count) {
+        std::cout << "  " << orientation << ": " << count << " surfaces" << std::endl;
+    }
+
+    // Azimuth comparison statistics - now includes ALL surfaces
+    if (std::any_of(roof_surfaces.begin(), roof_surfaces.end(),
+                    [](const auto& r) { return r.has_b3_azimut; })) {
+        std::cout << "\nAzimuth comparison with b3_azimut (ALL surfaces):" << std::endl;
+        double total_diff = 0.0;
+        int count = 0;
+        for (const auto& roof : roof_surfaces) {
+            if (roof.has_b3_azimut) {
+                double diff = std::abs(roof.azimuth - roof.b3_azimut);
+                // Handle wrap-around case (e.g., 359° vs 1°)
+                if (diff > 180.0) {
+                    diff = 360.0 - diff;
+                }
+                total_diff += diff;
+                count++;
+                std::cout << "  " << roof.surface_id << ": "
+                          << std::fixed << std::setprecision(2) << diff << "° difference" << std::endl;
+            }
+        }
+        if (count > 0) {
+            std::cout << "  Average difference: " << std::fixed << std::setprecision(2)
+                      << (total_diff / count) << "°" << std::endl;
+        }
+    }
+}
+
+// ------------------ Main Processing Functions ------------------
+
+void process_roof_surfaces(json& j) {
+    std::vector<RoofSurfaceInfo> roof_surfaces;
+
+    // Create individual roof surface CityObjects based on semantic definitions
+    create_individual_roof_surface_objects(j, roof_surfaces);
+
+    // Print summary
+    print_roof_surface_summary(roof_surfaces);
 }
 
 // ------------------ Main Function ------------------
 
 int main(int argc, const char* argv[]) {
-    const char* filename = (argc > 1) ? argv[1] : "10-282-562.city.json";
+    //const char* filename = (argc > 1) ? argv[1] : "10-282-562.city.json";
+    const char* filename = (argc > 1) ? argv[1] : "nextbk_2b.city.json";
+    std::cout << "========================================" << std::endl;
+    std::cout << "LoD 2.2 RoofSurface Processor" << std::endl;
     std::cout << "Processing: " << filename << std::endl;
+    std::cout << "========================================" << std::endl;
 
     // Read input file
     std::ifstream input(filename);
@@ -313,15 +628,22 @@ int main(int argc, const char* argv[]) {
     }
     input.close();
 
-    std::cout << "Total RoofSurfaces found: " << get_no_roof_surfaces(j) << std::endl;
+    std::cout << "Initial CityObjects count: " << j["CityObjects"].size() << std::endl;
 
-    // Process roof surfaces for orientation and area
+    // Count semantic RoofSurfaces in LoD 2.2 only (the actual number we want)
+    int semantic_roof_count = count_semantic_roof_surfaces_lod22(j);
+    std::cout << "LoD 2.2 RoofSurface definitions: " << semantic_roof_count << std::endl;
+
+    // Process roof surfaces based on semantic definitions
     process_roof_surfaces(j);
+
+    std::cout << "\nFinal CityObjects count: " << j["CityObjects"].size() << std::endl;
 
     // Additional processing (volume calculation, etc.)
     std::vector<double> fake_point = {0.0, 0.0, -1000.0};
     int nobuildings = 0;
 
+    std::cout << "\n=== Building Volume Calculation ===" << std::endl;
     for (auto& [id, co] : j["CityObjects"].items()) {
         if (co["type"] != "Building") continue;
 
@@ -333,6 +655,7 @@ int main(int argc, const char* argv[]) {
 
         if (!co.contains("children")) continue;
         for (const auto& child_id : co["children"]) {
+            if (!j["CityObjects"].contains(child_id.get<std::string>())) continue;
             const auto& child = j["CityObjects"][child_id.get<std::string>()];
             for (const auto& geom : child["geometry"]) {
                 if (geom["type"] != "Solid" || geom["lod"] != "2.2") continue;
@@ -388,7 +711,7 @@ int main(int argc, const char* argv[]) {
             if (len > 0) {
                 std::vector<double> avg_normal = {avg_nx / len, avg_ny / len, avg_nz / len};
                 double azimuth = azimuth_from_normal(avg_normal);
-                std::cout << " Roof azimuth: " << azimuth << " degrees from North" << std::endl;
+                std::cout << " Average roof azimuth: " << azimuth << " degrees from North" << std::endl;
                 j["CityObjects"][id]["attributes"]["roof_azimuth_deg"] = azimuth;
             }
         }
@@ -396,7 +719,7 @@ int main(int argc, const char* argv[]) {
         nobuildings++;
     }
 
-    std::cout << "\nProcessed " << nobuildings << " buildings." << std::endl;
+    std::cout << "\nProcessed " << nobuildings << " buildings for volume calculation." << std::endl;
     std::cout << "Number of vertices: " << j["vertices"].size() << std::endl;
 
     // Write output file
@@ -409,7 +732,10 @@ int main(int argc, const char* argv[]) {
     o << j.dump(2) << std::endl;
     o.close();
 
+    std::cout << "\n========================================" << std::endl;
     std::cout << "Output written to: out.city.json" << std::endl;
+    std::cout << "=== PROCESSING COMPLETE ===" << std::endl;
+    std::cout << "========================================" << std::endl;
 
     return 0;
 }
